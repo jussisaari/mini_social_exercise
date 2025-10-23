@@ -7,6 +7,7 @@ import sqlite3
 import hashlib
 import re
 from datetime import datetime
+from transformers import pipeline
 
 app = Flask(__name__)
 app.secret_key = '123456789' 
@@ -869,7 +870,7 @@ def loop_color(user_id):
 
 # ----- Functions to be implemented are below
 
-# Task 3.1
+# Task 3.3
 def recommend(user_id, filter_following):
     """
     Args:
@@ -914,7 +915,7 @@ def user_risk_analysis(user_id):
     return score;
 
     
-# Task 3.3
+# Task 3.1
 def moderate_content(content):
     """
     Args
@@ -934,9 +935,60 @@ def moderate_content(content):
 
     moderated_content = content
     score = 0
+
+    TIER1_PATTERN = r'\b(' + '|'.join(TIER1_WORDS) + r')\b'
+    matches = re.findall(TIER1_PATTERN, moderated_content, flags=re.IGNORECASE)
+    if matches:
+        score = 5
+        return "[content removed due to severe violation]", score
+    
+    TIER2_PATTERN = r'\b(' + '|'.join(TIER2_PHRASES) + r')\b'
+    matches = re.findall(TIER2_PATTERN, moderated_content, flags=re.IGNORECASE)
+    if matches:
+        score = 5
+        return "[content removed due to spam/scam policy]", score
+
+    TIER3_PATTERN = r'\b(' + '|'.join(TIER3_WORDS) + r')\b'
+    matches = re.findall(TIER3_PATTERN, moderated_content, flags=re.IGNORECASE)
+
+    score = len(matches) * 2.0
+    for match in matches:
+        moderated_content = moderated_content.replace(match, '*' * len(match))
+
+    #URL_PATTERN = r'https?://\S+|www\.\S+'
+    #URL_PATTERN = r"(?i)\b((?:https?://|www\d{0,3}[.]|[a-z0-9.\-]+[.][a-z]{2,4}/)(?:[^\s()<>]+|\(([^\s()<>]+|(\([^\s()<>]+\)))*\))+(?:\(([^\s()<>]+|(\([^\s()<>]+\)))*\)|[^\s`!()\[\]{};:'\".,<>?«»“”‘’]))"
+    URL_PATTERN = r"(?i)\b((?:https?://|www\d{0,3}[.]|[a-z0-9.\-]+(?:[.]|\[\])[a-z]{2,4}\b)(?:[^\s()<>]+|\([^\s()<>]+\))*(?:\([^\s()<>]+\)|[^\s`!()\[\]{};:'\".,<>?«»“”‘’]))"
+    # URL_PATTERN = r"(?:[a-zA-Z]+:\/\/)?([\w]+?(?:[\.]|\.))?([\w]+?(?:[\.]|\.)[\w]+"
+    url_matches = re.findall(URL_PATTERN, moderated_content)
+    url_matches = [match[0] for match in url_matches]
+    print(url_matches)
+
+    score += len(url_matches) * 2.0
+    for url in url_matches:
+        moderated_content = moderated_content.replace(url, '[link removed]')
+
+    all_alpha = 0
+    cap_alpha = 0
+    for i in range(len(moderated_content)):
+        if moderated_content[i].isalpha():
+            all_alpha += 1
+            if moderated_content[i].isupper():
+                cap_alpha += 1
+    
+    if all_alpha > 15:
+        if (cap_alpha / all_alpha) > 0.7:
+            score += 0.5
+
+    # Sentiment analysis
+    """model = "cardiffnlp/twitter-roberta-base-sentiment-latest"
+    sentiment_pipeline = pipeline("sentiment-analysis", model=model, tokenizer=model, device=0)
+    sentiment_result = sentiment_pipeline(moderated_content)
+    
+    # Negative sentiment -> +2 score
+    if sentiment_result[0]['label'] == 'negative':
+        score += 2.0"""
     
     return moderated_content, score
-
 
 if __name__ == '__main__':
     app.run(debug=True, port=8080)
