@@ -6,7 +6,7 @@ import json
 import sqlite3
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from transformers import pipeline
 
 app = Flask(__name__)
@@ -912,9 +912,79 @@ def user_risk_analysis(user_id):
     
     score = 0
 
-    return score;
+    db = get_db()
+    cursor = db.cursor()
 
-    
+    # Accounts age
+    cursor.execute(f"SELECT created_at FROM users WHERE id = {user_id}")
+    created_at = cursor.fetchone()[0]
+    age_days = datetime.now(timezone.utc).toordinal() - created_at.toordinal()
+
+    age_flag = False
+    if age_days < 7:
+        age_flag = True
+
+    # Users profile score
+    cursor.execute(f"SELECT profile FROM users WHERE id = {user_id}")
+    profile = cursor.fetchone()[0]
+
+    if profile != None:
+        _, profile_score = moderate_content(profile)
+    else:
+        profile_score = 0
+
+    # Users posts score
+    cursor.execute(f"SELECT content FROM posts WHERE user_id = {user_id}")
+    posts = cursor.fetchall()
+
+    risky_posts = 0
+    average_posts_score = 0
+    for post in posts:
+        _, post_score = moderate_content(post[0])
+        average_posts_score += post_score
+
+        if post_score > 1.0:
+            risky_posts += 1
+    if len(posts) > 0:
+        average_post_score = average_posts_score / len(posts)
+        if age_flag:
+            average_posts_score = average_post_score * 1.5
+        # if more than 50% of users posts are risky, proving that the user is a consistent bad actor
+        # we will double the risk score for posts
+        if risky_posts / len(posts) > 0.5:
+            average_posts_score = average_posts_score * 2
+
+    # Users comments score
+    cursor.execute(f"SELECT content FROM comments WHERE user_id = {user_id}")
+    comments = cursor.fetchall()
+
+    risky_comments = 0
+    average_comments_score = 0
+    for comment in comments:
+        _, comment_score = moderate_content(comment[0])
+        average_comments_score += comment_score
+
+        if comment_score > 1.0:
+            risky_comments += 1
+    if len(comments) > 0:
+        average_comments_score = average_comments_score / len(comments)
+        if age_flag:
+            average_comments_score = average_comments_score * 1.5
+        # if more than 50% of users comments are risky, proving that the user is a consistent bad actor
+        # we will double the risk score for comments
+        if risky_comments / len(comments) > 0.5:
+            average_comments_score = average_comments_score * 2
+
+    content_risk_score = (profile_score * 1) + (average_posts_score * 3) + (average_comments_score * 1)
+
+    user_risk_score = content_risk_score
+    if age_flag:
+        user_risk_score = content_risk_score * 1.5
+    elif age_days < 30:
+        user_risk_score = content_risk_score * 1.2
+
+    return user_risk_score
+
 # Task 3.1
 def moderate_content(content):
     """
@@ -961,7 +1031,6 @@ def moderate_content(content):
     # URL_PATTERN = r"(?:[a-zA-Z]+:\/\/)?([\w]+?(?:[\.]|\.))?([\w]+?(?:[\.]|\.)[\w]+"
     url_matches = re.findall(URL_PATTERN, moderated_content)
     url_matches = [match[0] for match in url_matches]
-    print(url_matches)
 
     score += len(url_matches) * 2.0
     for url in url_matches:
