@@ -7,7 +7,8 @@ import sqlite3
 import hashlib
 import re
 from datetime import datetime, timezone
-from transformers import pipeline
+import numpy as np
+from numpy.linalg import norm
 
 app = Flask(__name__)
 app.secret_key = '123456789' 
@@ -27,6 +28,11 @@ MODERATION_CONFIG = json.loads(decrypted_data)
 TIER1_WORDS = MODERATION_CONFIG['categories']['tier1_severe_violations']['words']
 TIER2_PHRASES = MODERATION_CONFIG['categories']['tier2_spam_scams']['phrases']
 TIER3_WORDS = MODERATION_CONFIG['categories']['tier3_mild_profanity']['words']
+
+# From https://gist.github.com/prasidhda/13c9303be3cbc4228585a7f1a06040a3
+with open("common_spam_words.txt", "r", encoding="utf-8") as f:
+    SPAM_WORDS = f.readlines()
+SPAM_WORDS = [word.lower().strip() for word in SPAM_WORDS]
 
 def get_db():
     """
@@ -890,10 +896,126 @@ def recommend(user_id, filter_following):
     - http://www.configworks.com/mz/handout_recsys_sac2010.pdf
     - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
     """
-
     recommended_posts = {} 
 
-    return recommended_posts;
+    if user_id is None:
+        return recommended_posts
+    db = get_db()
+    cursor = db.cursor()
+
+    # Getting all the posts the user has reacted to or commented on
+    cursor.execute(f"SELECT id, post_id FROM reactions WHERE user_id = {user_id}")
+    users_reactions = cursor.fetchall()
+    users_reactions = [reaction[1] for reaction in users_reactions]
+
+    cursor.execute(f"SELECT id, post_id FROM comments WHERE user_id = {user_id}")
+    users_comments = cursor.fetchall()
+    users_comments = [comment[1] for comment in users_comments]
+    if users_reactions == [] and users_comments == []:
+        return {}
+    # Using the posts to find a set of users that have reacted or commented on the same posts
+    # This assures that the we are not getting random users that have nothing in common with the target user
+    users = []
+    for users_based_on_reaction in users_reactions:
+        post_id = users_based_on_reaction
+        cursor.execute(f"SELECT user_id FROM reactions WHERE post_id = {post_id}")
+        reaction_users = list(cursor.fetchall())
+        reaction_users = [user[0] for user in reaction_users]
+        users.extend(reaction_users)
+
+    for users_based_on_comment in users_comments:
+        post_id = users_based_on_comment
+        cursor.execute(f"SELECT user_id FROM comments WHERE post_id = {post_id}")
+        comment_users = list(cursor.fetchall())
+        comment_users = [user[0] for user in comment_users]
+        users.extend(comment_users)
+
+    # Creating a dictionary of all the users and their engagements. Reactions are worth 1 point, comments are worth 2 points.
+    users = dict.fromkeys(sorted(users), {})
+    post_ids = []
+    for user in users:
+        # For each user we get their reactions and comments for the nested dictionary
+        cursor.execute(f"SELECT id, post_id, user_id FROM reactions WHERE user_id = {user}")
+        user_reactions = sorted(cursor.fetchall(), key=lambda x: x[1])
+        post_ids.extend([reaction[1] for reaction in user_reactions])
+        user_reactions_dict = {}
+        for reaction in user_reactions:
+            post_id = reaction[1]
+            if post_id in user_reactions_dict:
+                user_reactions_dict[post_id] += 1
+            else:
+                user_reactions_dict[post_id] = 1
+        cursor.execute(f"SELECT id, post_id, user_id FROM comments WHERE user_id = {user}")
+        user_comments = sorted(cursor.fetchall(), key=lambda x: x[1])
+        post_ids.extend([comment[1] for comment in user_comments])
+        user_comments_dict = {}
+        for comment in user_comments:
+            post_id = comment[1]
+            if post_id in user_comments_dict:
+                user_comments_dict[post_id] += 2
+            else:
+                user_comments_dict[post_id] = 2
+        users[user] = {**user_reactions_dict, **user_comments_dict}
+    post_ids = sorted(set(post_ids))
+
+    the_user_array = []
+    users_array = []
+    for user in users:
+        for post_id in post_ids:
+            if post_id not in users[user]:
+                users[user][post_id] = 0
+        users[user] = {x: users[user][x] for x in sorted(users[user])}
+        if user == user_id:
+            the_user_array = np.array(list(users[user].values()))
+            users_array.append(the_user_array)
+        else:
+            users_array.append(np.array(list(users[user].values())))
+
+    cosine_similarities = np.dot(users_array, the_user_array) / (norm(users_array, axis=1) * norm(the_user_array))
+    # Selecting the top 20 most similar users
+    similar_users_list = sorted(zip(users.keys(), cosine_similarities), key=lambda x: x[1], reverse=True)[1:21]
+
+    possible_recommendations = [post for post in users[user_id].keys() if users[user_id][post] == 0]
+
+    if possible_recommendations == []:
+        return {}
+    
+    recommended_posts = {}
+    for post in possible_recommendations:
+        divided = 0
+        divisor = 0
+        for similar_user in similar_users_list:
+            user = similar_user[0]
+            similarity_score = similar_user[1]
+            divided += users[user][post] * similarity_score
+            divisor += similarity_score
+        result = divided / divisor if divisor != 0 else 0
+        recommended_posts[post] = result
+
+    recommended_posts = dict(sorted(recommended_posts.items(), key=lambda item: item[1], reverse=True))
+    recommended_posts_list = tuple(recommended_posts.keys())
+
+    query = f"""
+            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+            FROM posts p
+            JOIN users u ON p.user_id = u.id
+            WHERE p.id IN ({','.join('?' for _ in recommended_posts_list)})
+            ORDER BY p.created_at DESC
+        """
+    cursor.execute(query, recommended_posts_list)
+    posts = cursor.fetchall()
+    
+    if filter_following:
+        cursor.execute(f"SELECT followed_id FROM follows WHERE follower_id = {user_id}")
+        following = cursor.fetchall()
+        following = [follow[0] for follow in following]
+        if following == []:
+            return {}
+        posts = [post for post in posts if post[4] in following]
+        if posts == []:
+            return {}
+    
+    return posts[:5]
 
 # Task 3.2
 def user_risk_analysis(user_id):
@@ -910,8 +1032,6 @@ def user_risk_analysis(user_id):
         Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
     
-    score = 0
-
     db = get_db()
     cursor = db.cursor()
 
@@ -1002,12 +1122,15 @@ def moderate_content(content):
             password: admin
     Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
+    if not content or content.strip() == "":
+        return content, 0.0
 
     moderated_content = content
     score = 0
 
     TIER1_PATTERN = r'\b(' + '|'.join(TIER1_WORDS) + r')\b'
     matches = re.findall(TIER1_PATTERN, moderated_content, flags=re.IGNORECASE)
+    
     if matches:
         score = 5
         return "[content removed due to severe violation]", score
@@ -1017,24 +1140,28 @@ def moderate_content(content):
     if matches:
         score = 5
         return "[content removed due to spam/scam policy]", score
-
-    TIER3_PATTERN = r'\b(' + '|'.join(TIER3_WORDS) + r')\b'
-    matches = re.findall(TIER3_PATTERN, moderated_content, flags=re.IGNORECASE)
-
-    score = len(matches) * 2.0
-    for match in matches:
-        moderated_content = moderated_content.replace(match, '*' * len(match))
-
-    #URL_PATTERN = r'https?://\S+|www\.\S+'
-    #URL_PATTERN = r"(?i)\b((?:https?://|www\d{0,3}[.]|[a-z0-9.\-]+[.][a-z]{2,4}/)(?:[^\s()<>]+|\(([^\s()<>]+|(\([^\s()<>]+\)))*\))+(?:\(([^\s()<>]+|(\([^\s()<>]+\)))*\)|[^\s`!()\[\]{};:'\".,<>?«»“”‘’]))"
-    URL_PATTERN = r"(?i)\b((?:https?://|www\d{0,3}[.]|[a-z0-9.\-]+(?:[.]|\[\])[a-z]{2,4}\b)(?:[^\s()<>]+|\([^\s()<>]+\))*(?:\([^\s()<>]+\)|[^\s`!()\[\]{};:'\".,<>?«»“”‘’]))"
-    # URL_PATTERN = r"(?:[a-zA-Z]+:\/\/)?([\w]+?(?:[\.]|\.))?([\w]+?(?:[\.]|\.)[\w]+"
+    
+    URL_PATTERN = r'\S+(?:\[?\.\]?|/)\S+'
     url_matches = re.findall(URL_PATTERN, moderated_content)
-    url_matches = [match[0] for match in url_matches]
 
+    if url_matches:
+        SPAM_PATTERN = r'\b(' + '|'.join(SPAM_WORDS) + r')\b'
+        spam_matches = re.findall(SPAM_PATTERN, moderated_content, flags=re.IGNORECASE)
+        spam_matches.pop() if spam_matches else None
+        if spam_matches:
+            score = 5
+            return "[content removed due to spam/scam policy]", score
+    
     score += len(url_matches) * 2.0
     for url in url_matches:
         moderated_content = moderated_content.replace(url, '[link removed]')
+
+    TIER3_PATTERN = r'\b(' + '|'.join(TIER3_WORDS) + r')\b'
+    matches = re.findall(TIER3_PATTERN, moderated_content, flags=re.IGNORECASE)
+    
+    score += len(matches) * 2.0
+    for match in matches:
+        moderated_content = moderated_content.replace(match, '*' * len(match))
 
     all_alpha = 0
     cap_alpha = 0
@@ -1048,15 +1175,6 @@ def moderate_content(content):
         if (cap_alpha / all_alpha) > 0.7:
             score += 0.5
 
-    # Sentiment analysis
-    """model = "cardiffnlp/twitter-roberta-base-sentiment-latest"
-    sentiment_pipeline = pipeline("sentiment-analysis", model=model, tokenizer=model, device=0)
-    sentiment_result = sentiment_pipeline(moderated_content)
-    
-    # Negative sentiment -> +2 score
-    if sentiment_result[0]['label'] == 'negative':
-        score += 2.0"""
-    
     return moderated_content, score
 
 if __name__ == '__main__':
